@@ -7,7 +7,7 @@
     - Какую использовать БД и как быстро визуализировать?
 - Обновления по воздуху
     - Чтобы можно было перепрошить МК у удаленных клиентов
-
+- Передача состояние через лампочку
 
 Received body: ssid=DIR-825-5G&pass=60488527
 */
@@ -27,6 +27,7 @@ Received body: ssid=DIR-825-5G&pass=60488527
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_check.h"
 #include "esp_intr_alloc.h"
 #include "esp_system.h"
 #include "esp_timer.h"  
@@ -40,6 +41,7 @@ Received body: ssid=DIR-825-5G&pass=60488527
 #include "ap.h"
 #include "sta.h"
 #include "http_client.h"
+#include "store.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -125,13 +127,13 @@ static void button_handler_task(void* arg)
     }
 }
 
-static void init_boot_button_interrupt(void)
+static esp_err_t init_boot_button_interrupt(void)
 {
     // Create queue for ISR -> task communication
     button_press_queue = xQueueCreate(10, sizeof(uint32_t));
     if (button_press_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create button queue");
-        return;
+        ESP_LOGE(TAG, "failed to create button queue");
+        return ESP_FAIL;
     }
 
     // Configure GPIO as input with internal pull-up
@@ -142,18 +144,25 @@ static void init_boot_button_interrupt(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_NEGEDGE,  // Interrupt on FALLING edge (button press)
     };
-    gpio_config(&io_conf);
+
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf), TAG, "failed to config gpuo=%d", BOOT_BUTTON_GPIO);
 
     // Install ISR service (level 1 priority, auto-clear on edge)
-    gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
+    ESP_RETURN_ON_ERROR(gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1), TAG, "failed to gpio_install_isr_service");
     
     // Hook ISR handler (GPIO0 as argument)
-    gpio_isr_handler_add(BOOT_BUTTON_GPIO, boot_button_isr_handler, (void*) BOOT_BUTTON_GPIO);
+    ESP_RETURN_ON_ERROR(gpio_isr_handler_add(BOOT_BUTTON_GPIO, boot_button_isr_handler, (void*) BOOT_BUTTON_GPIO),
+        TAG, "failed to gpio_isr_handler_add");
 
     // Start handler task
-    xTaskCreate(button_handler_task, "button_task", 4096, NULL, 10, NULL);
+    BaseType_t ret =  xTaskCreate(button_handler_task, "button_task", 4096, NULL, 10, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "failed to create task: ret=%d", (int)ret);
+        return ESP_FAIL;
+    }
 
-    ESP_LOGI(TAG, "BOOT button interrupt initialized (GPIO%d, FALLING edge)", BOOT_BUTTON_GPIO);
+    ESP_LOGI(TAG, "BOOT button interrupt initialized: gpio=%d", BOOT_BUTTON_GPIO);
+    return ESP_OK;
 }
 
 void start_midi(void) {
@@ -225,17 +234,10 @@ void init_local_time(void)
 void app_main(void)
 {
     // Initialize NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-
-    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(init_store());
 
     // Initialize BOOT button interrupt FIRST (works in both modes)
-    init_boot_button_interrupt();
+    ESP_ERROR_CHECK(init_boot_button_interrupt());
 
     // Decide mode based on NVS contents
     if (credentials_exist_in_nvs()) {
@@ -246,6 +248,20 @@ void app_main(void)
         xTaskCreate(http_client_task, "http_client_task", 8192, NULL, 6, NULL);
     } else {
         ESP_LOGI(TAG, "No credentials, starting AP config (setup mode)");
-        start_wifi_ap_config();
+
+        user_config_t *config = get_user_config();
+        if (config == NULL) {
+            ESP_LOGE(TAG, "No user config");
+            abort();
+        }
+
+        esp_err_t err = save_credentials_to_nvs(config->ssid, config->pass);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to save cred to nvs: %d", err);
+            abort();
+        }
+
+        ESP_LOGI(TAG, "esp restart with ssid/pass in nvs: %s/%s", config->ssid, config->pass);
+        esp_restart();
     }
 }

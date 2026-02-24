@@ -3,10 +3,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "esp_netif.h"
 #include "nvs.h"
 #include "esp_mac.h"
@@ -14,18 +16,21 @@
 #include "esp_http_server.h"
 
 #include "ap.h"
-
-#define WIFI_CRED_NAMESPACE "wifi_cfg"
-#define WIFI_CRED_SSID_KEY  "home_ssid"
-#define WIFI_CRED_PASS_KEY  "home_pass"
+#include "nvs.h"
 
 // Config-mode AP parameters.
-#define CONFIG_AP_SSID     "config_ap"
+#define CONFIG_AP_SSID     "ESP_MIDI_WIFI"
 #define CONFIG_AP_PASS     ""
 #define CONFIG_AP_CHANNEL  1
 #define CONFIG_AP_MAX_CONN 1
 
+
+static user_config_t passed_config;
+
 static const char *TAG = "APP_WIFI_AP";
+static EventGroupHandle_t config_passed_event_group;
+
+#define CONFIG_PASSED_BIT BIT0
 
 static const char *INDEX_HTML =
     "<!DOCTYPE html>"
@@ -40,35 +45,6 @@ static const char *INDEX_HTML =
     "</form>"
     "</body>"
     "</html>";
-
-static esp_err_t save_credentials_to_nvs(const char *ssid, const char *pass)
-{
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(WIFI_CRED_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_str(nvs, WIFI_CRED_SSID_KEY, ssid);
-    if (err == ESP_OK) {
-        err = nvs_set_str(nvs, WIFI_CRED_PASS_KEY, pass);
-    }
-
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs);
-    }
-
-    nvs_close(nvs);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Saved home Wi‑Fi credentials: ssid='%s'", ssid);
-    } else {
-        ESP_LOGE(TAG, "Failed to save credentials: %s", esp_err_to_name(err));
-    }
-
-    return err;
-}
 
 static void wifi_ap_event_handler(void *arg,
                                   esp_event_base_t event_base,
@@ -183,12 +159,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Received body: %s", buf);
 
-    char ssid[64];
-    char pass[64];
-    parse_form_body(buf, ssid, sizeof(ssid), pass, sizeof(pass));
+    char passed_ssid[64];
+    char passed_pass[64];
+    parse_form_body(buf, passed_ssid, sizeof(passed_ssid), passed_pass, sizeof(passed_pass));
     free(buf);
-
-    save_credentials_to_nvs(ssid, pass);
 
     const char *resp =
         "<html><body><h1>Saved!</h1>"
@@ -197,9 +171,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
 
-    // Small delay to allow HTTP to flush, then reboot.
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+    memcpy(passed_config.ssid, passed_ssid, strlen(passed_ssid));
+    memcpy(passed_config.pass, passed_pass, strlen(passed_pass));
+
+    xEventGroupSetBits(config_passed_event_group, CONFIG_PASSED_BIT);
 
     return ESP_OK;
 }
@@ -230,13 +205,23 @@ static httpd_handle_t start_webserver(void)
     return server;
 }
 
-void start_wifi_ap_config(void)
+user_config_t* get_user_config(void)
 {
     wifi_init_config_ap();
     start_webserver();
 
-    // Just keep running in config mode.
-    while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    config_passed_event_group = xEventGroupCreate();
+
+    EventBits_t bits = xEventGroupWaitBits(
+        config_passed_event_group,
+        CONFIG_PASSED_BIT,
+        pdFALSE,
+        pdFALSE,
+        portMAX_DELAY);
+
+
+    if (bits & CONFIG_PASSED_BIT) {
+        return &passed_config;
     }
+    return NULL;
 }
